@@ -1,6 +1,0 @@
-pandas
-yfinance
-ta
-streamlit
-tradingview-ta
-streamlit-autorefresh
