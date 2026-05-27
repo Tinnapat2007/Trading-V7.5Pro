@@ -1,0 +1,749 @@
+"""
+AI Trade Hunter Pro
+===================
+Streamlit scanner for Crypto, Forex, and Gold.
+
+Data sources:
+  OHLCV       -> Yahoo Finance
+  Indicators  -> ta library (RSI, MACD, EMA, ATR, Bollinger Bands, ADX)
+  Signals     -> Local scoring model focused on trend, swing, congestion, and momentum
+
+Run:
+  streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
+from typing import Iterable
+
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+from ta.momentum import RSIIndicator
+from ta.trend import ADXIndicator, EMAIndicator, MACD
+from ta.volatility import AverageTrueRange, BollingerBands
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
+
+# ============================================================================
+# Config
+# ============================================================================
+APP_VERSION = "v1.0"
+MAX_ASSETS = 20
+MIN_BARS_REQUIRED = 80
+YF_DOWNLOAD_TIMEOUT = 35
+MAX_AUTO_FAIL = 3
+
+DEFAULT_FOREX = "EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD, EURJPY"
+DEFAULT_CRYPTO = "BTC-USD, ETH-USD, SOL-USD, BNB-USD, XRP-USD, ADA-USD, DOGE-USD"
+DEFAULT_GOLD = "XAUUSD, GC=F"
+
+FOREX_CURRENCIES = {
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "NOK", "SEK", "DKK",
+    "SGD", "HKD", "CNY", "CNH", "TWD", "KRW", "THB", "MYR", "IDR", "PHP", "VND", "INR",
+    "SAR", "AED", "QAR", "KWD", "BHD", "OMR", "EGP", "ZAR", "NGN", "KES", "GHS",
+    "PLN", "HUF", "CZK", "RUB", "UAH", "ILS", "TRY", "MXN", "BRL", "CLP", "COP", "PEN", "ARS",
+}
+
+CRYPTO_ALIASES = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "SOL": "SOL-USD",
+    "BNB": "BNB-USD",
+    "XRP": "XRP-USD",
+    "ADA": "ADA-USD",
+    "DOGE": "DOGE-USD",
+    "AVAX": "AVAX-USD",
+    "LINK": "LINK-USD",
+    "DOT": "DOT-USD",
+    "MATIC": "MATIC-USD",
+    "LTC": "LTC-USD",
+}
+
+GOLD_ALIASES = {
+    "XAU": "GC=F",
+    "XAUUSD": "GC=F",
+    "GOLD": "GC=F",
+    "GC": "GC=F",
+    "GC=F": "GC=F",
+}
+
+TF_MAP = {
+    "5m": {"period": "5d", "interval": "5m", "label": "5m Scalping"},
+    "15m": {"period": "10d", "interval": "15m", "label": "15m Intraday"},
+    "1h": {"period": "90d", "interval": "1h", "label": "1h Day Trade"},
+    "1d": {"period": "1y", "interval": "1d", "label": "1D Position"},
+}
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("trade_hunter")
+
+
+# ============================================================================
+# Models
+# ============================================================================
+@dataclass(frozen=True)
+class Asset:
+    display: str
+    yf_symbol: str
+    market: str
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+        if math.isnan(out) or math.isinf(out):
+            return default
+        return out
+    except Exception:
+        return default
+
+
+def clean_token(raw: str) -> str:
+    return raw.strip().upper().replace("/", "").replace(" ", "")
+
+
+def normalize_asset(raw: str, allowed_markets: set[str]) -> tuple[Asset | None, str | None]:
+    token = clean_token(raw)
+    if not token:
+        return None, None
+
+    if "Gold" in allowed_markets and token in GOLD_ALIASES:
+        return Asset(display="XAUUSD", yf_symbol=GOLD_ALIASES[token], market="Gold"), None
+
+    if "Crypto" in allowed_markets:
+        crypto_symbol = token
+        if crypto_symbol in CRYPTO_ALIASES:
+            crypto_symbol = CRYPTO_ALIASES[crypto_symbol]
+        elif re.fullmatch(r"[A-Z0-9]{2,12}USD", crypto_symbol):
+            crypto_symbol = f"{crypto_symbol[:-3]}-USD"
+        elif re.fullmatch(r"[A-Z0-9]{2,12}-USD", crypto_symbol):
+            crypto_symbol = crypto_symbol
+
+        if crypto_symbol.endswith("-USD"):
+            display = crypto_symbol.replace("-USD", "USD")
+            return Asset(display=display, yf_symbol=crypto_symbol, market="Crypto"), None
+
+    if "Forex" in allowed_markets:
+        forex_symbol = re.sub(r"[^A-Z]", "", token)
+        if len(forex_symbol) == 6:
+            base = forex_symbol[:3]
+            quote = forex_symbol[3:]
+            if base in FOREX_CURRENCIES and quote in FOREX_CURRENCIES and base != quote:
+                return Asset(display=forex_symbol, yf_symbol=f"{forex_symbol}=X", market="Forex"), None
+
+    return None, f"`{raw}` ไม่ตรงกับตลาดที่เลือก หรือ Yahoo Finance ไม่รองรับ"
+
+
+def dedupe_assets(assets: Iterable[Asset]) -> list[Asset]:
+    seen: set[str] = set()
+    output: list[Asset] = []
+    for asset in assets:
+        if asset.yf_symbol not in seen:
+            output.append(asset)
+            seen.add(asset.yf_symbol)
+    return output
+
+
+def price_format(symbol: str, market: str, price: float) -> str:
+    if market == "Forex" and "JPY" not in symbol:
+        return f"{price:,.5f}"
+    if market == "Forex":
+        return f"{price:,.3f}"
+    if market == "Crypto" and price < 10:
+        return f"{price:,.4f}"
+    return f"{price:,.2f}"
+
+
+def pip_or_point_label(market: str) -> str:
+    if market == "Forex":
+        return "Pips"
+    if market == "Gold":
+        return "Points"
+    return "%"
+
+
+def atr_display(asset: Asset, atr: float, price: float) -> str:
+    if atr <= 0 or price <= 0:
+        return "N/A"
+    if asset.market == "Forex":
+        mult = 100 if "JPY" in asset.display else 10_000
+        return f"{atr * mult:.1f} Pips"
+    if asset.market == "Gold":
+        return f"{atr:.2f} Points"
+    return f"{(atr / price) * 100:.2f}%"
+
+
+# ============================================================================
+# Data
+# ============================================================================
+@st.cache_data(ttl=55, show_spinner=False)
+def fetch_yfinance_cached(tickers_tuple: tuple[str, ...], period: str, interval: str) -> pd.DataFrame:
+    tickers = list(tickers_tuple)
+
+    def _download() -> pd.DataFrame:
+        return yf.download(
+            tickers=tickers,
+            period=period,
+            interval=interval,
+            group_by="ticker",
+            progress=False,
+            threads=True,
+            auto_adjust=True,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(_download).result(timeout=YF_DOWNLOAD_TIMEOUT)
+    except FuturesTimeoutError:
+        logger.error("Yahoo Finance download timed out")
+    except Exception as exc:
+        logger.error("Yahoo Finance download failed: %s", exc)
+    return pd.DataFrame()
+
+
+def extract_df(all_yf: pd.DataFrame, yf_symbol: str, is_single: bool) -> pd.DataFrame:
+    if all_yf is None or all_yf.empty:
+        return pd.DataFrame()
+
+    field_names = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+
+    try:
+        if is_single:
+            df = all_yf.copy()
+            if isinstance(df.columns, pd.MultiIndex):
+                lvl0 = set(df.columns.get_level_values(0))
+                df.columns = df.columns.get_level_values(0) if lvl0 & field_names else df.columns.get_level_values(1)
+        else:
+            if not isinstance(all_yf.columns, pd.MultiIndex):
+                return pd.DataFrame()
+            lvl0 = set(all_yf.columns.get_level_values(0))
+            if lvl0 & field_names:
+                swapped = all_yf.swaplevel(axis=1)
+                if yf_symbol not in swapped.columns.get_level_values(0):
+                    return pd.DataFrame()
+                df = swapped[yf_symbol].copy()
+            else:
+                if yf_symbol not in lvl0:
+                    return pd.DataFrame()
+                df = all_yf[yf_symbol].copy()
+
+        needed = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+        return df.dropna(subset=needed)
+    except Exception as exc:
+        logger.error("extract_df failed for %s: %s", yf_symbol, exc)
+        return pd.DataFrame()
+
+
+def fallback_single_download(yf_symbol: str, period: str, interval: str) -> pd.DataFrame:
+    try:
+        df = yf.download(
+            tickers=yf_symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=True,
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        needed = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+        return df.dropna(subset=needed)
+    except Exception as exc:
+        logger.error("fallback download failed for %s: %s", yf_symbol, exc)
+        return pd.DataFrame()
+
+
+# ============================================================================
+# Scoring
+# ============================================================================
+def compute_market_state(df: pd.DataFrame) -> dict:
+    result = {
+        "is_valid": False,
+        "warnings": [],
+        "bar_count": len(df),
+        "price": 0.0,
+        "rsi": 50.0,
+        "macd_hist": 0.0,
+        "ema20": 0.0,
+        "ema50": 0.0,
+        "ema200": 0.0,
+        "atr": 0.0,
+        "atr_pct": 0.0,
+        "adx": 0.0,
+        "bb_width_pct": 0.0,
+        "range_position": 50.0,
+        "slope20_pct": 0.0,
+        "swing_score": 0.0,
+        "trend_score": 0.0,
+        "momentum_score": 0.0,
+        "congestion_score": 0.0,
+        "breakout_score": 0.0,
+        "direction_bias": 0.0,
+    }
+
+    if df.empty or len(df) < 35:
+        result["warnings"].append(f"ข้อมูลน้อยเกินไป ({len(df)} แท่ง)")
+        return result
+
+    try:
+        close = df["Close"].astype(float).squeeze()
+        high = df["High"].astype(float).squeeze()
+        low = df["Low"].astype(float).squeeze()
+
+        price = safe_float(close.iloc[-1])
+        result["price"] = price
+
+        rsi = RSIIndicator(close=close, window=14).rsi()
+        macd_hist = MACD(close=close).macd_diff()
+        ema20 = EMAIndicator(close=close, window=20).ema_indicator()
+        ema50 = EMAIndicator(close=close, window=50).ema_indicator()
+        atr = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+        adx = ADXIndicator(high=high, low=low, close=close, window=14).adx()
+        bb = BollingerBands(close=close, window=20, window_dev=2)
+
+        result["rsi"] = safe_float(rsi.dropna().iloc[-1] if not rsi.dropna().empty else 50.0, 50.0)
+        result["macd_hist"] = safe_float(macd_hist.dropna().iloc[-1] if not macd_hist.dropna().empty else 0.0)
+        result["ema20"] = safe_float(ema20.dropna().iloc[-1] if not ema20.dropna().empty else price)
+        result["ema50"] = safe_float(ema50.dropna().iloc[-1] if not ema50.dropna().empty else price)
+        result["atr"] = safe_float(atr.dropna().iloc[-1] if not atr.dropna().empty else 0.0)
+        result["adx"] = safe_float(adx.dropna().iloc[-1] if not adx.dropna().empty else 0.0)
+        result["atr_pct"] = (result["atr"] / price) * 100 if price > 0 else 0.0
+
+        bb_high = bb.bollinger_hband()
+        bb_low = bb.bollinger_lband()
+        latest_bb_high = safe_float(bb_high.dropna().iloc[-1] if not bb_high.dropna().empty else price)
+        latest_bb_low = safe_float(bb_low.dropna().iloc[-1] if not bb_low.dropna().empty else price)
+        result["bb_width_pct"] = ((latest_bb_high - latest_bb_low) / price) * 100 if price > 0 else 0.0
+
+        lookback = min(50, len(df))
+        range_high = safe_float(high.tail(lookback).max())
+        range_low = safe_float(low.tail(lookback).min())
+        if range_high > range_low:
+            result["range_position"] = ((price - range_low) / (range_high - range_low)) * 100
+
+        if len(df) >= 80:
+            ema200 = EMAIndicator(close=close, window=min(200, len(df) - 1)).ema_indicator()
+            result["ema200"] = safe_float(ema200.dropna().iloc[-1] if not ema200.dropna().empty else price)
+        else:
+            result["warnings"].append("ข้อมูลไม่พอสำหรับ EMA200 แบบเต็ม ใช้ EMA20/50 เป็นหลัก")
+
+        if len(ema20.dropna()) >= 8 and price > 0:
+            now = safe_float(ema20.dropna().iloc[-1])
+            before = safe_float(ema20.dropna().iloc[-8])
+            result["slope20_pct"] = ((now - before) / price) * 100
+
+        trend_score = 0.0
+        if price > result["ema20"] > result["ema50"]:
+            trend_score += 28
+        elif price > result["ema20"]:
+            trend_score += 14
+        elif price < result["ema20"] < result["ema50"]:
+            trend_score -= 28
+        elif price < result["ema20"]:
+            trend_score -= 14
+
+        if result["ema200"] > 0:
+            if price > result["ema200"] and result["ema50"] > result["ema200"]:
+                trend_score += 12
+            elif price < result["ema200"] and result["ema50"] < result["ema200"]:
+                trend_score -= 12
+
+        slope_boost = clamp(result["slope20_pct"] * 60, -10, 10)
+        trend_score += slope_boost
+
+        momentum_score = 0.0
+        momentum_score += 12 if result["macd_hist"] > 0 else -12
+        if result["rsi"] >= 58:
+            momentum_score += 16
+        elif result["rsi"] > 51:
+            momentum_score += 8
+        elif result["rsi"] <= 42:
+            momentum_score -= 16
+        elif result["rsi"] < 49:
+            momentum_score -= 8
+
+        # Swing is good when volatility is tradable but not chaotic.
+        atr_pct = result["atr_pct"]
+        if 0.20 <= atr_pct <= 2.80:
+            swing_score = 18
+        elif 0.08 <= atr_pct < 0.20 or 2.80 < atr_pct <= 4.50:
+            swing_score = 8
+        else:
+            swing_score = -12
+
+        if result["adx"] >= 25:
+            swing_score += 7
+        elif result["adx"] < 15:
+            swing_score -= 10
+
+        # Congestion: narrow bands + weak ADX + stuck in middle of range.
+        stuck_mid_range = 35 <= result["range_position"] <= 65
+        narrow_band = result["bb_width_pct"] < max(0.35, atr_pct * 1.8)
+        if stuck_mid_range and narrow_band and result["adx"] < 18:
+            congestion_score = -25
+        elif stuck_mid_range and result["adx"] < 16:
+            congestion_score = -15
+        else:
+            congestion_score = 6
+
+        breakout_score = 0.0
+        if result["range_position"] >= 82 and result["adx"] >= 20 and result["macd_hist"] > 0:
+            breakout_score = 12
+        elif result["range_position"] <= 18 and result["adx"] >= 20 and result["macd_hist"] < 0:
+            breakout_score = -12
+
+        result["trend_score"] = clamp(trend_score, -45, 45)
+        result["momentum_score"] = clamp(momentum_score, -30, 30)
+        result["swing_score"] = clamp(swing_score, -20, 25)
+        result["congestion_score"] = congestion_score
+        result["breakout_score"] = breakout_score
+        result["direction_bias"] = result["trend_score"] + result["momentum_score"] + result["breakout_score"]
+        result["is_valid"] = True
+    except Exception as exc:
+        logger.error("compute_market_state failed: %s", exc)
+        result["warnings"].append("คำนวณ indicator ไม่สำเร็จ")
+
+    return result
+
+
+def build_trade_call(asset: Asset, state: dict) -> dict:
+    direction_bias = safe_float(state.get("direction_bias"))
+    quality_score = (
+        abs(direction_bias)
+        + safe_float(state.get("swing_score"))
+        + safe_float(state.get("congestion_score"))
+    )
+    quality_score = clamp(quality_score, 0, 100)
+
+    if not state.get("is_valid"):
+        side = "WAIT"
+        signal = "⚪ WAIT"
+        confidence = 0.0
+        reason = "ข้อมูลไม่พอ"
+    elif state["congestion_score"] <= -20:
+        side = "WAIT"
+        signal = "🟡 WAIT - ราคาติดกรอบ"
+        confidence = clamp(quality_score, 35, 65)
+        reason = "ราคาแกว่งในกรอบแคบ ADX อ่อน ยังไม่คุ้มเสี่ยง"
+    elif direction_bias >= 28 and quality_score >= 45:
+        side = "LONG"
+        signal = "🟢 LONG เด่น"
+        confidence = quality_score
+        reason = "แนวโน้มขึ้น + momentum หนุน + volatility พอเทรด"
+    elif direction_bias <= -28 and quality_score >= 45:
+        side = "SHORT"
+        signal = "🔴 SHORT เด่น"
+        confidence = quality_score
+        reason = "แนวโน้มลง + momentum กดลง + volatility พอเทรด"
+    elif abs(direction_bias) >= 18:
+        side = "WATCH"
+        signal = "🔎 WATCH"
+        confidence = clamp(quality_score, 35, 70)
+        reason = "เริ่มมีทิศ แต่คะแนนยังไม่ครบ รอจังหวะยืนยัน"
+    else:
+        side = "WAIT"
+        signal = "🟡 WAIT"
+        confidence = clamp(quality_score, 25, 55)
+        reason = "ทิศทางยังไม่ชัด"
+
+    long_run = "ขึ้นยาว" if state["trend_score"] >= 30 and state["adx"] >= 22 else ""
+    down_run = "ลงยาว" if state["trend_score"] <= -30 and state["adx"] >= 22 else ""
+    choppy = "ติดขัด/ไซด์เวย์" if state["congestion_score"] < 0 else "ไม่ติดมาก"
+
+    return {
+        "asset": asset,
+        "side": side,
+        "signal": signal,
+        "confidence": confidence,
+        "quality_score": quality_score,
+        "reason": reason,
+        "run_state": long_run or down_run or choppy,
+        "state": state,
+    }
+
+
+def sort_trade_calls(calls: list[dict]) -> list[dict]:
+    rank = {"LONG": 0, "SHORT": 0, "WATCH": 1, "WAIT": 2}
+    return sorted(calls, key=lambda item: (rank.get(item["side"], 9), -item["quality_score"]))
+
+
+# ============================================================================
+# UI
+# ============================================================================
+st.set_page_config(
+    page_title="AI Trade Hunter Pro",
+    page_icon="🎯",
+    layout="wide",
+)
+
+st.markdown(
+    """
+<style>
+    .block-container {
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+        max-width: 1160px;
+    }
+    .trade-card {
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        border-radius: 8px;
+        padding: 0.85rem;
+        margin-bottom: 0.75rem;
+        background: rgba(250, 250, 250, 0.03);
+    }
+    .trade-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        margin-bottom: 0.25rem;
+    }
+    .trade-meta {
+        font-size: 0.82rem;
+        color: rgba(128, 128, 128, 0.95);
+    }
+    @media (max-width: 768px) {
+        h1 { font-size: 1.35rem !important; }
+        h2, h3 { font-size: 1.05rem !important; }
+        .block-container { padding-left: 0.7rem; padding-right: 0.7rem; }
+        .stButton > button { width: 100% !important; padding: 0.45rem !important; }
+        [data-testid="metric-container"] label { font-size: 0.68rem !important; }
+        [data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: 1rem !important; }
+        .trade-card { padding: 0.7rem; }
+        .trade-title { font-size: 0.98rem; }
+    }
+    .stDataFrame { overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.title(f"🎯 AI Trade Hunter Pro ({APP_VERSION})")
+st.caption("สแกน Crypto / Forex / Gold เพื่อหา symbol ที่น่าเทรดที่สุด จาก trend, swing, momentum, volatility และภาวะราคาติดกรอบ")
+
+st.warning(
+    "**คำเตือน:** ระบบนี้เป็นตัวช่วยวิเคราะห์เชิงเทคนิค ไม่ใช่คำแนะนำการลงทุน "
+    "ตลาด Crypto, Forex และ Gold มีความเสี่ยงสูง ควรกำหนด SL และขนาดสัญญาเองทุกครั้ง"
+)
+
+for key, value in {"auto_mode": False, "run_once": False, "fail_count": 0}.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+with st.sidebar:
+    st.header("ตั้งค่า")
+    market_choices = st.multiselect(
+        "ตลาดที่ต้องการสแกน",
+        options=["Crypto", "Forex", "Gold"],
+        default=["Crypto", "Forex", "Gold"],
+    )
+    tf_key = st.selectbox(
+        "Timeframe",
+        options=list(TF_MAP.keys()),
+        index=2,
+        format_func=lambda x: TF_MAP[x]["label"],
+    )
+    top_n = st.slider("แสดง Top", min_value=3, max_value=20, value=10)
+
+default_symbols = ", ".join(
+    part
+    for market, part in [
+        ("Crypto", DEFAULT_CRYPTO),
+        ("Forex", DEFAULT_FOREX),
+        ("Gold", DEFAULT_GOLD),
+    ]
+    if market in market_choices
+)
+
+user_input = st.text_area(
+    f"Symbols ที่ต้องการสแกน สูงสุด {MAX_ASSETS} ตัว",
+    value=default_symbols,
+    height=100,
+    help="ตัวอย่าง: BTC, ETH, SOL, EURUSD, USDJPY, XAUUSD หรือ GC=F",
+)
+
+btn1, btn2, btn3 = st.columns(3)
+with btn1:
+    if st.button("🔍 สแกนทันที", use_container_width=True):
+        st.session_state.update({"auto_mode": False, "run_once": True, "fail_count": 0})
+        st.rerun()
+with btn2:
+    if st.button("🔄 Auto 60s", use_container_width=True):
+        st.session_state.update({"auto_mode": True, "run_once": False, "fail_count": 0})
+        st.rerun()
+with btn3:
+    if st.button("🛑 หยุด", use_container_width=True):
+        st.session_state.update({"auto_mode": False, "run_once": False, "fail_count": 0})
+        st.rerun()
+
+if st.session_state.auto_mode:
+    if st_autorefresh:
+        st_autorefresh(interval=60_000, key="trade_hunter_refresh")
+    else:
+        st.warning("ติดตั้ง `streamlit-autorefresh` เพื่อให้ Auto 60s ทำงาน")
+    st.info(f"Auto Refresh ทุก 60 วินาที | ล้มเหลว {st.session_state.fail_count}/{MAX_AUTO_FAIL}")
+
+allowed_markets = set(market_choices)
+raw_symbols = [x.strip() for x in re.split(r"[,|\n]", user_input) if x.strip()]
+assets: list[Asset] = []
+rejected: list[str] = []
+
+for raw_symbol in raw_symbols:
+    asset, error = normalize_asset(raw_symbol, allowed_markets)
+    if asset:
+        assets.append(asset)
+    elif error:
+        rejected.append(error)
+
+assets = dedupe_assets(assets)
+if len(assets) > MAX_ASSETS:
+    st.warning(f"จำกัด {MAX_ASSETS} symbols ต่อรอบ ระบบตัดส่วนเกินออก")
+    assets = assets[:MAX_ASSETS]
+
+if rejected:
+    st.error("Symbols บางตัวใช้ไม่ได้:\n" + "\n".join(f"- {item}" for item in rejected))
+
+tf = TF_MAP[tf_key]
+
+if (st.session_state.run_once or st.session_state.auto_mode) and assets:
+    calls: list[dict] = []
+    success_count = 0
+
+    tickers = tuple(asset.yf_symbol for asset in assets)
+    is_single = len(assets) == 1
+
+    progress = st.progress(0, text="กำลังโหลดข้อมูลจาก Yahoo Finance...")
+    with st.spinner("กำลังดาวน์โหลด OHLCV..."):
+        all_yf = fetch_yfinance_cached(tickers, period=tf["period"], interval=tf["interval"])
+
+    for index, asset in enumerate(assets):
+        progress.progress((index + 1) / len(assets), text=f"กำลังวิเคราะห์ {asset.display}...")
+        df = extract_df(all_yf, asset.yf_symbol, is_single)
+        if df.empty:
+            df = fallback_single_download(asset.yf_symbol, tf["period"], tf["interval"])
+
+        state = compute_market_state(df)
+        call = build_trade_call(asset, state)
+        calls.append(call)
+        if state.get("is_valid"):
+            success_count += 1
+        time.sleep(0.05)
+
+    progress.empty()
+
+    if success_count == 0:
+        st.session_state.fail_count += 1
+        if st.session_state.fail_count >= MAX_AUTO_FAIL:
+            st.session_state.auto_mode = False
+            st.error("API ล้มเหลวหลายครั้งติด ระบบหยุด Auto Refresh แล้ว")
+    else:
+        st.session_state.fail_count = 0
+
+    ranked = sort_trade_calls(calls)
+    actionable = [call for call in ranked if call["side"] in {"LONG", "SHORT"}]
+
+    st.divider()
+    st.subheader("ตัวที่น่าเทรดที่สุด")
+
+    best = actionable[0] if actionable else ranked[0]
+    best_asset = best["asset"]
+    best_state = best["state"]
+    st.markdown(
+        f"""
+<div class="trade-card">
+  <div class="trade-title">{best["signal"]} · {best_asset.display} · {best_asset.market}</div>
+  <div class="trade-meta">
+    คะแนน {best["quality_score"]:.0f}/100 · มั่นใจ {best["confidence"]:.0f}% · {best["reason"]}<br>
+    ราคา {price_format(best_asset.display, best_asset.market, best_state["price"])} ·
+    ATR {atr_display(best_asset, best_state["atr"], best_state["price"])} ·
+    สภาวะ: {best["run_state"]}
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    rows = []
+    for call in ranked[:top_n]:
+        asset = call["asset"]
+        state = call["state"]
+        rows.append(
+            {
+                "อันดับ": len(rows) + 1,
+                "Symbol": asset.display,
+                "ตลาด": asset.market,
+                "สัญญาณ": call["signal"],
+                "คะแนน": f"{call['quality_score']:.0f}",
+                "มั่นใจ": f"{call['confidence']:.0f}%",
+                "ราคา": price_format(asset.display, asset.market, state["price"]),
+                "ATR": atr_display(asset, state["atr"], state["price"]),
+                "ADX": f"{state['adx']:.1f}",
+                "RSI": f"{state['rsi']:.1f}",
+                "สภาวะ": call["run_state"],
+            }
+        )
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("เจาะคะแนนรายตัว")
+
+    for call in ranked[:top_n]:
+        asset = call["asset"]
+        state = call["state"]
+        with st.expander(f"{call['signal']} · {asset.display} · คะแนน {call['quality_score']:.0f}/100"):
+            for warning in state.get("warnings", []):
+                st.caption(f"⚠️ {warning}")
+
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Trend", f"{state['trend_score']:+.0f}")
+                st.metric("RSI", f"{state['rsi']:.1f}")
+            with m2:
+                st.metric("Momentum", f"{state['momentum_score']:+.0f}")
+                st.metric("ADX", f"{state['adx']:.1f}")
+            with m3:
+                st.metric("Swing", f"{state['swing_score']:+.0f}")
+                st.metric("ATR", atr_display(asset, state["atr"], state["price"]))
+
+            score_df = pd.DataFrame(
+                [
+                    {"หัวข้อ": "Trend EMA20/50/200 + slope", "คะแนน": f"{state['trend_score']:+.1f}"},
+                    {"หัวข้อ": "RSI + MACD Momentum", "คะแนน": f"{state['momentum_score']:+.1f}"},
+                    {"หัวข้อ": "Swing / Volatility / ADX", "คะแนน": f"{state['swing_score']:+.1f}"},
+                    {"หัวข้อ": "ราคาติดกรอบ / congestion", "คะแนน": f"{state['congestion_score']:+.1f}"},
+                    {"หัวข้อ": "Breakout จากกรอบ 50 แท่ง", "คะแนน": f"{state['breakout_score']:+.1f}"},
+                ]
+            )
+            st.dataframe(score_df, use_container_width=True, hide_index=True)
+
+            if call["side"] in {"LONG", "SHORT"} and state["atr"] > 0:
+                st.info(
+                    f"แผนตัวอย่าง: {call['side']} | TP1 ประมาณ 1x ATR, TP2 ประมาณ 2x ATR, "
+                    f"SL ประมาณ 0.7x ATR | ใช้เป็นกรอบวางแผน ไม่ใช่คำสั่งเทรด"
+                )
+            else:
+                st.caption("ยังไม่ใช่จังหวะเด่น ระบบแนะนำให้รอราคาหลุดกรอบหรือมี momentum ชัดขึ้น")
+
+    st.session_state.run_once = False
+
+elif not assets:
+    st.info("กรอก symbol หรือเลือกตลาดที่ต้องการสแกนก่อน แล้วกด `สแกนทันที`")
